@@ -140,3 +140,28 @@ else:
         5. If an image fails to load, the cell shows a red error message.
         6. **Download** your finished file.
         """)
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    background-color: #fff;
+    color: #888ea8;
+    text-align: center;
+    padding: 10px 0;
+    font-size: 0.75rem;
+    border-top: 1px solid #dde1ef;
+    font-family: 'Inter', sans-serif;
+    font-weight: 500;
+    letter-spacing: 0.03em;
+    z-index: 999;
+}
+</style>
+<div class="footer">
+    © Designed and Developed by Saurabh Malavade
+</div>
+""", unsafe_allow_html=True)
