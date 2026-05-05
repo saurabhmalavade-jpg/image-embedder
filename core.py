@@ -11,9 +11,9 @@ import gc
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-BATCH_SIZE   = 50          # Process N images at a time — keeps RAM flat
-MAX_WORKERS  = 8           # Conservative thread count; plenty for I/O-bound work
-IMG_WIDTH    = 150         # Target image width in pixels
+BATCH_SIZE      = 50       # Process N images at a time — keeps RAM flat
+MAX_WORKERS     = 8        # Conservative thread count; plenty for I/O-bound work
+CELL_WIDTH_PX   = 150      # Cell display width in pixels (does NOT affect image resolution)
 REQUEST_TIMEOUT = 20       # Seconds per image download
 
 
@@ -40,24 +40,24 @@ def download_and_process_image(task):
             orig_w, orig_h = pil_img.size
             aspect = orig_h / orig_w if orig_w else 1
 
-            # Resize in-memory to target width to reduce Excel file size
-            new_w = IMG_WIDTH
-            new_h = int(new_w * aspect)
-            resized = pil_img.convert("RGB").resize((new_w, new_h), PILImage.LANCZOS)
-
+            # ── Keep ORIGINAL resolution — no downscaling ──────────────────
+            # Only convert to RGBA-safe PNG for lossless embedding
             buf = io.BytesIO()
-            resized.save(buf, format="JPEG", quality=85, optimize=True)
+            pil_img.convert("RGBA").save(buf, format="PNG")
             buf.seek(0)
             img_bytes = buf.getvalue()          # plain bytes — no open handles
 
+        # Cell display size stays at CELL_WIDTH_PX but image data is full-res
+        display_h = int(CELL_WIDTH_PX * aspect)
+
         return {
-            'status':     'success',
-            'task':       task,
-            'img_bytes':  img_bytes,
-            'img_width':  new_w,
-            'img_height': new_h,
-            'row_height': new_h * 0.75,
-            'col_width':  new_w / 7,
+            'status':      'success',
+            'task':        task,
+            'img_bytes':   img_bytes,
+            'img_width':   CELL_WIDTH_PX,       # how wide the cell shows it
+            'img_height':  display_h,           # how tall the cell shows it
+            'row_height':  display_h * 0.75,
+            'col_width':   CELL_WIDTH_PX / 7,
         }
 
     except Exception as exc:
