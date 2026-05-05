@@ -1,4 +1,6 @@
 # core.py — Pure logic, no UI, no tkinter
+# Mirrors the original CMD script logic for maximum speed
+
 import openpyxl
 from openpyxl.drawing.image import Image
 from openpyxl.styles import Font
@@ -7,81 +9,101 @@ from PIL import Image as PILImage
 import io
 import concurrent.futures
 import os
+import time
 import gc
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+BATCH_SIZE      = 100                            # larger batches = fewer overhead cycles
+MAX_WORKERS     = min(32, (os.cpu_count() or 1) * 5)  # same as original script
+REQUEST_TIMEOUT = 20
+MAX_RETRIES     = 3
+BACKOFF         = 0.75
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-BATCH_SIZE      = 50       # Process N images at a time — keeps RAM flat
-MAX_WORKERS     = 8        # Conservative thread count; plenty for I/O-bound work
-CELL_WIDTH_PX   = 150      # Cell display width in pixels (does NOT affect image resolution)
-REQUEST_TIMEOUT = 20       # Seconds per image download
+# Same headers as your original script — critical for servers that block plain requests
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ExcelImageFetcher/1.0; +https://pattern.com)",
+    "Accept": "image/*,application/octet-stream;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
+def fetch_bytes_with_retries(url):
+    """Download bytes with retries + proper headers. Same as original script."""
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            last_exc = e
+            if attempt < MAX_RETRIES:
+                time.sleep(BACKOFF * attempt)
+    raise last_exc
 
 
 def download_and_process_image(task):
     """
-    Worker: download one image URL and return compressed bytes + dimensions.
-    Returns bytes (not an openpyxl Image) so the object is picklable and
-    does NOT hold an open file handle across batch boundaries.
+    Worker: download one image, return raw bytes + metadata.
+    Returns bytes instead of openpyxl Image so it's thread-safe.
+    Same logic as original script but decoupled from openpyxl.
     """
     url = task['url']
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
+        raw = fetch_bytes_with_retries(url)
 
-        # ── FIX: open twice — once to verify/resize, once clean for openpyxl ──
-        raw = response.content
+        # Fully decode image (same as original — avoids verify() trap)
+        pil_img = PILImage.open(io.BytesIO(raw))
+        pil_img.load()
 
-        # Verify + get dimensions using a fresh buffer
-        with PILImage.open(io.BytesIO(raw)) as pil_img:
-            pil_img.verify()                        # raises if corrupt
-            # Re-open (verify() closes the image internally)
+        # Handle all image modes (WEBP, HEIC, CMYK, etc.) — same as original
+        if pil_img.mode in ("P", "LA"):
+            pil_img = pil_img.convert("RGBA")
+        elif pil_img.mode not in ("RGB", "RGBA"):
+            pil_img = pil_img.convert("RGB")
 
-        with PILImage.open(io.BytesIO(raw)) as pil_img:
-            orig_w, orig_h = pil_img.size
-            aspect = orig_h / orig_w if orig_w else 1
+        # Re-encode as PNG — robust for all Excel/openpyxl versions
+        out_buf = io.BytesIO()
+        pil_img.save(out_buf, format="PNG", optimize=True)
+        out_buf.seek(0)
+        img_bytes = out_buf.getvalue()
 
-            # ── Keep ORIGINAL resolution — no downscaling ──────────────────
-            # Only convert to RGBA-safe PNG for lossless embedding
-            buf = io.BytesIO()
-            pil_img.convert("RGBA").save(buf, format="PNG")
-            buf.seek(0)
-            img_bytes = buf.getvalue()          # plain bytes — no open handles
-
-        # Cell display size stays at CELL_WIDTH_PX but image data is full-res
-        display_h = int(CELL_WIDTH_PX * aspect)
+        # Sizing: 150px wide, preserve aspect ratio — same as original
+        aspect_ratio = pil_img.height / pil_img.width if pil_img.width else 1.0
+        img_w = 150
+        img_h = img_w * aspect_ratio
 
         return {
-            'status':      'success',
-            'task':        task,
-            'img_bytes':   img_bytes,
-            'img_width':   CELL_WIDTH_PX,       # how wide the cell shows it
-            'img_height':  display_h,           # how tall the cell shows it
-            'row_height':  display_h * 0.75,
-            'col_width':   CELL_WIDTH_PX / 7,
+            'status':     'success',
+            'task':       task,
+            'img_bytes':  img_bytes,
+            'img_width':  img_w,
+            'img_height': img_h,
+            'row_height': img_h * 0.75,
+            'col_width':  img_w / 7,
         }
 
-    except Exception as exc:
+    except Exception:
         return {
             'status': 'error',
             'task':   task,
-            'reason': str(exc),
         }
 
 
 def _embed_batch(workbook, batch_results, red_font, stats):
-    """Embed one batch of download results into the workbook (single-threaded)."""
+    """Embed one batch into workbook. Single-threaded — openpyxl is not thread-safe."""
     for result in batch_results:
         task_info = result['task']
         sheet = workbook[task_info['sheet_name']]
         cell  = sheet[task_info['coordinate']]
 
         if result['status'] == 'success':
-            # Build the openpyxl Image object HERE (main thread, after download)
             img_obj        = Image(io.BytesIO(result['img_bytes']))
             img_obj.width  = result['img_width']
             img_obj.height = result['img_height']
 
-            sheet.row_dimensions[cell.row].height          = result['row_height']
+            sheet.row_dimensions[cell.row].height             = result['row_height']
             sheet.column_dimensions[cell.column_letter].width = result['col_width']
             cell.value = None
             sheet.add_image(img_obj, cell.coordinate)
@@ -129,13 +151,12 @@ def process_excel(input_bytes, progress_callback=None):
         output.seek(0)
         return output, stats
 
-    # ── Process in batches ────────────────────────────────────────────────────
+    # ── Process in batches — high concurrency like original script ─────────────
     completed = 0
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = tasks_to_process[batch_start : batch_start + BATCH_SIZE]
 
-        # Download this batch concurrently
         batch_results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(download_and_process_image, task): task
@@ -143,14 +164,12 @@ def process_excel(input_bytes, progress_callback=None):
             for future in concurrent.futures.as_completed(futures):
                 batch_results.append(future.result())
 
-        # Embed into workbook (single-threaded — openpyxl is not thread-safe)
         _embed_batch(workbook, batch_results, red_font, stats)
 
         completed += len(batch)
         if progress_callback:
             progress_callback(completed, total)
 
-        # Free memory before next batch
         del batch_results
         gc.collect()
 
